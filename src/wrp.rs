@@ -6,14 +6,28 @@ use std::io::Result as IoResult;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{Duration, Instant};
+use tokio::time::{sleep_until, Duration, Instant};
+
+pub trait SerialPacing {
+    /// Set the internal delay, if we want to override the default calculated one.
+    fn set_delay(&mut self, delay: Duration);
+}
 
 pin_project! {
     #[derive(Debug)]
-    pub struct SerialWrapper<S> {
+    pub struct SerialReadPacing<S> {
         #[pin]
         inner: S,
         read_wait: Pin<Box<tokio::time::Sleep>>,
+        delay: Duration,
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    pub struct SerialWritePacing<S> {
+        #[pin]
+        inner: S,
         write_wait: Pin<Box<tokio::time::Sleep>>,
         delay: Duration,
     }
@@ -59,92 +73,104 @@ pub fn wait_time(port: &impl tokio_serial::SerialPort) -> Duration {
     Duration::from_micros(wait_time)
 }
 
+// we do not want to trigger a timer the first time read/write is polled, thus we
+// explicitly create a timer that expires 1ms in the past.
+fn past() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_millis(1)).unwrap_or(now)
+}
 // In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
 // but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
 // I would gain anything from it.
-// impl<S>  From<S> for SerialWrapper<S> where S: AsyncRead + AsyncWrite { .... }
+// impl<S>  From<S> for SerialReadPacing<S> where S: AsyncRead + AsyncWrite { .... }
 // The whole thing w ould be identical?
-impl From<tokio_serial::SerialStream> for SerialWrapper<tokio_serial::SerialStream> {
+impl From<tokio_serial::SerialStream> for SerialReadPacing<tokio_serial::SerialStream> {
     fn from(inner: tokio_serial::SerialStream) -> Self {
-        use tokio::time::sleep_until;
-        // we do not want to trigger a timer the first time read/write is polled, thus we
-        // explicitly create a timer that expires 1ms in the past.
-        let now = Instant::now();
-        // let past = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+        let past = past();
         let read_wait = Box::pin(sleep_until(past));
-        let write_wait = Box::pin(sleep_until(past));
-        SerialWrapper {
+        Self {
             inner,
             read_wait,
+            delay: Duration::ZERO,
+        }
+    }
+}
+
+// In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
+// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
+// I would gain anything from it.
+// impl<S>  From<S> for SerialWritePacing<S> where S: AsyncRead + AsyncWrite { .... }
+// The whole thing w ould be identical?
+impl From<tokio_serial::SerialStream> for SerialWritePacing<tokio_serial::SerialStream> {
+    fn from(inner: tokio_serial::SerialStream) -> Self {
+        let past = past();
+        let write_wait = Box::pin(sleep_until(past));
+        Self {
+            inner,
             write_wait,
             delay: Duration::ZERO,
         }
     }
 }
 
-// If you find it so desirable, implementing SerialPort for the SerialWrapper should be
+// If you find it so desirable, implementing SerialPort for the SerialReadPacing should be
 // perfectly possible, but I do not see the point to do so, as there's no real trait bound _I_
 // need that require it
-impl<S> SerialWrapper<S> {
+impl<S> SerialPacing for SerialReadPacing<S> {
     /// Set the internal delay, if we want to override the default calculated one.
-    pub fn set_delay(&mut self, delay: Duration) {
+    fn set_delay(&mut self, delay: Duration) {
         // info!(delay = delay.as_micros(), "Setting serial flush/read delay");
         self.delay = delay;
     }
 }
 
-impl<S> AsyncRead for SerialWrapper<S>
+// If you find it so desirable, implementing SerialPort for the SerialWritePacing should be
+// perfectly possible, but I do not see the point to do so, as there's no real trait bound _I_
+// need that require it
+impl<S> SerialPacing for SerialWritePacing<S> {
+    /// Set the internal delay, if we want to override the default calculated one.
+    fn set_delay(&mut self, delay: Duration) {
+        // info!(delay = delay.as_micros(), "Setting serial flush/read delay");
+        self.delay = delay;
+    }
+}
+
+impl<S> AsyncRead for SerialReadPacing<S>
 where
-    S: AsyncRead + Unpin + std::fmt::Debug,
+    S: AsyncRead + Unpin,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        eprintln!("Poll read enter {self:?}");
         let this = self.project();
         // If our read wait is not yet ready, we return early.
         // This is to enforce a silence between us finishing a write_flush and starting a
         // receive, as there should be a 3.5 character timeout in between
-        
+
         // Check if the deadline is in the future before we await the timer, otherwise it causes a
         // few ms of extra time spent, for some reason.
         if this.read_wait.deadline() >= Instant::now() {
+            // Now schedule the timer/timeout to wait for the deadline.
             if this.read_wait.as_mut().poll(cx).is_pending() {
-                eprintln!("Poll read pending");
                 return Poll::Pending;
             }
         }
-        match this.inner.poll_read(cx, buf) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(data) => {
-                eprintln!("Arming write delay due to poll_read");
-                let wait = Instant::now() + *this.delay;
-                this.write_wait.as_mut().reset(wait);
-                Poll::Ready(data)
-            }
-        }
+        this.inner.poll_read(cx, buf)
     }
 }
-impl<S> AsyncWrite for SerialWrapper<S>
+impl<S> AsyncWrite for SerialReadPacing<S>
 where
     S: AsyncWrite + Unpin,
 {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
         let this = self.project();
-        eprintln!("Poll write enter");
-        // Check if we are in read to Write pacing or not.
-        if this.write_wait.as_mut().poll(cx).is_pending() {
-            eprintln!("Poll write pending");
-            return Poll::Pending;
-        }
         match this.inner.poll_write(cx, buf) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(data) => {
                 // Flush has finished, re-arm the read_wait timeout so our next read will be
                 // after a moment of silence
-                eprintln!("Arming read delay due to poll_write");
                 let wait = Instant::now() + *this.delay;
                 this.read_wait.as_mut().reset(wait);
                 Poll::Ready(data)
@@ -152,12 +178,8 @@ where
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        eprintln!("Entering poll_flush");
         let this = self.project();
-        if this.write_wait.as_mut().poll(cx).is_pending() {
-            eprintln!("Poll flush pending");
-            return Poll::Pending;
-        }
+
         // After a succesful _flush_ of the write buffer, we want to have a moment of Silence
         // before the next _read_ or _write_ of data.
         // Thus we probably want to write a timeout on "flush" and then on the next write, or
@@ -167,12 +189,67 @@ where
             Poll::Ready(data) => {
                 // Flush has finished, re-arm the read_wait timeout so our next read will be
                 // after a moment of silence
-                eprintln!("Arming read delay due to poll_flush");
                 let wait = Instant::now() + *this.delay;
                 this.read_wait.as_mut().reset(wait);
                 Poll::Ready(data)
             }
         }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
+}
+
+impl<S> AsyncRead for SerialWritePacing<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<IoResult<()>> {
+        let this = self.project();
+        // If our read wait is not yet ready, we return early.
+        // This is to enforce a silence between us finishing a write_flush and starting a
+        // receive, as there should be a 3.5 character timeout in between
+        match this.inner.poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(data) => {
+                let wait = Instant::now() + *this.delay;
+                this.write_wait.as_mut().reset(wait);
+                Poll::Ready(data)
+            }
+        }
+    }
+}
+impl<S> AsyncWrite for SerialWritePacing<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
+        let this = self.project();
+        // Check if the deadline is in the future before we await the timer, otherwise it causes a
+        // few ms of extra time spent, for some reason.
+        if this.write_wait.deadline() >= Instant::now() {
+            // Now schedule the timer/timeout to wait for the deadline.
+            if this.write_wait.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+        this.inner.poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        let this = self.project();
+        // Check if the deadline is in the future before we await the timer, otherwise it causes a
+        // few ms of extra time spent, for some reason.
+        if this.write_wait.deadline() >= Instant::now() {
+            // Now schedule the timer/timeout to wait for the deadline.
+            if this.write_wait.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+        this.inner.poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         self.project().inner.poll_shutdown(cx)
