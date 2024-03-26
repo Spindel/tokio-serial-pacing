@@ -1,5 +1,5 @@
 // Author: D.S. Ljungmark <spider@skuggor.se>, Modio FA AB
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::io::Result as IoResult;
@@ -8,13 +8,29 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{sleep_until, Duration, Instant};
 
+/// Shared trait for [SerialReadPacing] and [SerialWritePacing] that implements `set_delay`
 pub trait SerialPacing {
-    /// Set the internal delay, if we want to override the default calculated one.
+    /// Set the internal delay, if we want to override the default, which is [Duration::ZERO]
     fn set_delay(&mut self, delay: Duration);
 }
 
 pin_project! {
     #[derive(Debug)]
+    /// Implement pacing by waiting between Write and Read operations.
+    ///
+    /// Will wait for _at least_ `delay` after an AsyncWrite and the next Read operation.
+    ///
+    /// Example
+    /// ```rust
+    /// # #[tokio::main(flavor="current_thread")]
+    /// # async fn main() -> std::io::Result<()> {
+    /// # use tokio_serial_pacing::SerialReadPacing;
+    /// # use tokio_serial::SerialStream;
+    ///   let (tx, rx) = tokio_serial::SerialStream::pair().expect("Failed to open PTY");
+    ///   let mut rx: SerialReadPacing<SerialStream> = rx.into();
+    /// #     Ok(())
+    /// # }
+    /// ```
     pub struct SerialReadPacing<S> {
         #[pin]
         inner: S,
@@ -25,6 +41,24 @@ pin_project! {
 
 pin_project! {
     #[derive(Debug)]
+    /// Implement pacing by waiting between Read and Write operations.
+    ///
+    /// It will wait for  _at least_ `delay` after an Async Read operation, before performing the
+    /// next _write_ operation.
+    ///
+    /// Other Read operations are not delayed.
+    ///
+    /// Example
+    /// ```rust
+    /// # #[tokio::main(flavor="current_thread")]
+    /// # async fn main() -> std::io::Result<()> {
+    /// # use tokio_serial_pacing::SerialWritePacing;
+    /// # use tokio_serial::SerialStream;
+    ///   let (tx, rx) = tokio_serial::SerialStream::pair().expect("Failed to open PTY");
+    ///   let mut rx: SerialWritePacing<SerialStream> = rx.into();
+    /// #     Ok(())
+    /// # }
+    /// ```
     pub struct SerialWritePacing<S> {
         #[pin]
         inner: S,
@@ -33,7 +67,26 @@ pin_project! {
     }
 }
 
-// get the modbus wait time from a serialport / Serial stream
+/// Calculate the Modbus RTU 3.5t wait time from a serial port
+///
+///
+/// This should calculate a Delay based on baudrate/parity/data bits on a SerialPort
+///
+/// Example
+/// ```rust
+/// # #[tokio::main(flavor="current_thread")]
+/// # async fn main() -> std::io::Result<()> {
+/// # use tokio_serial::{SerialPort, SerialStream};
+/// # use std::time::Duration;
+///   use tokio_serial_pacing::{SerialPacing, SerialWritePacing, wait_time};
+///   let (tx, mut rx) = tokio_serial::SerialStream::pair().expect("Failed to open PTY");
+///   let delay = wait_time(&rx);
+///   assert_eq!(delay, Duration::from_micros(1750), "High baudrate should have a delay of 1.75ms");
+///   let mut rx: SerialWritePacing<SerialStream> = rx.into();
+///   rx.set_delay(delay);
+/// #     Ok(())
+/// # }
+/// ```
 pub fn wait_time(port: &impl tokio_serial::SerialPort) -> Duration {
     use tokio_serial::{DataBits, Parity, StopBits};
     let byte_size = {
@@ -79,11 +132,18 @@ fn past() -> Instant {
     let now = Instant::now();
     now.checked_sub(Duration::from_millis(1)).unwrap_or(now)
 }
-// In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
-// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
-// I would gain anything from it.
+
+/// Wrap a [tokio_serial::SerialStream] with Read Pacing, causing a delay between a Write and the
+/// next Read.
+///
+/// This is probably not useful in practice.
+///
+/// In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
+/// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
+/// I would gain anything from it.
+///
 // impl<S>  From<S> for SerialReadPacing<S> where S: AsyncRead + AsyncWrite { .... }
-// The whole thing w ould be identical?
+// The whole thing would be identical?
 impl From<tokio_serial::SerialStream> for SerialReadPacing<tokio_serial::SerialStream> {
     fn from(inner: tokio_serial::SerialStream) -> Self {
         let past = past();
@@ -96,11 +156,18 @@ impl From<tokio_serial::SerialStream> for SerialReadPacing<tokio_serial::SerialS
     }
 }
 
-// In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
-// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
-// I would gain anything from it.
-// impl<S>  From<S> for SerialWritePacing<S> where S: AsyncRead + AsyncWrite { .... }
-// The whole thing w ould be identical?
+/// Wrap a [tokio_serial::SerialStream] with Write Pacing, causing a delay between a Read and the
+/// next Write operation.
+/// This is required according to the Modbus RTU standard, and some equipment will (properly) fail
+/// to respond to commands that come too quickly after another message was sent.
+///
+///
+///
+/// In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
+/// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
+/// I would gain anything from it.
+// impl<S> From<S> for SerialWritePacing<S> where S: AsyncRead + AsyncWrite { .... }
+// The whole thing would be identical?
 impl From<tokio_serial::SerialStream> for SerialWritePacing<tokio_serial::SerialStream> {
     fn from(inner: tokio_serial::SerialStream) -> Self {
         let past = past();
@@ -113,9 +180,9 @@ impl From<tokio_serial::SerialStream> for SerialWritePacing<tokio_serial::Serial
     }
 }
 
-// If you find it so desirable, implementing SerialPort for the SerialReadPacing should be
-// perfectly possible, but I do not see the point to do so, as there's no real trait bound _I_
-// need that require it
+/// If you find it so desirable, implementing SerialPort for the SerialReadPacing should be
+/// perfectly possible, but I do not see the point to do so, as there's no real trait bound _I_
+/// need that require it
 impl<S> SerialPacing for SerialReadPacing<S> {
     /// Set the internal delay, if we want to override the default calculated one.
     fn set_delay(&mut self, delay: Duration) {
@@ -124,9 +191,9 @@ impl<S> SerialPacing for SerialReadPacing<S> {
     }
 }
 
-// If you find it so desirable, implementing SerialPort for the SerialWritePacing should be
-// perfectly possible, but I do not see the point to do so, as there's no real trait bound _I_
-// need that require it
+/// If you find it so desirable, implementing SerialPort for the SerialWritePacing should be
+/// perfectly possible, but I do not see the point to do so, as there's no real trait bound _I_
+/// need that require it
 impl<S> SerialPacing for SerialWritePacing<S> {
     /// Set the internal delay, if we want to override the default calculated one.
     fn set_delay(&mut self, delay: Duration) {

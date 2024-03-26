@@ -2,15 +2,15 @@
 name = "tokio_serial_pacing"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bytes = "1.6.0"
 pin-project-lite = "0.2.13"
-serialport = { version = "4.3.0", default-features = false }
 tokio = { version = "1.36.0", features = ["time"] }
 tokio-serial = "5.4.4"
 
 [dev-dependencies]
+serialport = { version = "4.3.0", default-features = false }
 tokio = { version = "1.36.0", features = ["time", "macros", "rt", "io-util"] }

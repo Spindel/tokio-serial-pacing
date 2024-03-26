@@ -1,10 +1,36 @@
+// Author: D.S. Ljungmark <spider@skuggor.se>, Modio FA AB
+// SPDX-License-Identifier: MIT
+//! This crate is a simple wrapper around
+//!
+//! [tokio_serial::SerialStream](https://docs.rs/tokio-serial/latest/tokio_serial/struct.SerialStream.html)
+//! for use with [tokio-modbus](https://docs.rs/tokio-modbus/latest/tokio_modbus/) in RTU mode.
+//! The wrappers can ensure that an application obeys the inter frame delay of 3.5 characters
+//! between reading and writing.
+//!
+//! The helper `wait_time` can attempt to calculate the proper delay from the serial port settings.
+//! In practice, the timers in tokio are not very exact, but since in theory, it's always okay to
+//! have a longer delay, that is not considered a big concern.
+//!
+//! the SerialPacing  trait just wraps the "set_delay" function as shared functionality, and then
+//! SerialReadPacing and SerialWritePacing implement the functionality around AsyncRead and
+//! AsyncWrite traits.
+//!
+//! Example
+//! ```rust
+//! #[tokio::main(flavor="current_thread")]
+//! async fn main() -> std::io::Result<()> {
+//!   use tokio_serial::{SerialPort, SerialStream};
+//!   use tokio_serial_pacing::{SerialPacing, SerialWritePacing};
+//!
+//!   let (tx, mut rx) = SerialStream::pair().expect("Failed to open PTY");
+//!   let mut rx: SerialWritePacing<SerialStream> = rx.into();
+//!   rx.set_delay(std::time::Duration::from_millis(3));
+//!   Ok(())
+//! }
+//! ```
 mod wrp;
 pub use wrp::wait_time;
 pub use wrp::{SerialPacing, SerialReadPacing, SerialWritePacing};
-
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
 
 #[cfg(test)]
 mod tests {
@@ -26,8 +52,10 @@ mod tests {
         assert_eq!(out, Duration::from_micros(1750));
     }
 
+    // Perform a read-write operation
     async fn read_write<T, U>(mut tx: T, mut rx: U)
     where
+        // Trait bounds how I love you, wait. That other thing. Ewww.
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -47,7 +75,6 @@ mod tests {
             tx.write_all(write_buf)
                 .await
                 .expect("TX=>RX Failed to write bytes to PTY");
-
             eprintln!("TX=>RX Flushing");
             tx.flush().await.expect("TX: can flush fail? on a PTY");
             // we write an ack back to the sender.
@@ -90,13 +117,12 @@ mod tests {
             let (tx, rx) = SerialStream::pair().expect("Failed to open PTY");
             let start = Instant::now();
             read_write(tx, rx).await;
-            start.elapsed()
+            start.elapsed().as_micros()
         };
         assert!(
-            time_before < Duration::from_millis(1),
-            "It should not take a millisecond to write a line."
+            time_before < 1000,
+            "It should not take a millisecond normally."
         );
-
         let time_after = {
             let (tx, rx) = SerialStream::pair().expect("Failed to open PTY");
             // Wrap the _rx_ in the delay code, as it must ensure that it only writes a reply after the
@@ -106,15 +132,11 @@ mod tests {
 
             let start = Instant::now();
             read_write(tx, rx).await;
-            start.elapsed()
+            start.elapsed().as_micros()
         };
-        println!(
-            "time_before {} time_after {}",
-            time_before.as_micros(),
-            time_after.as_micros()
-        );
+        println!("time_before={time_before} time_after={time_after}");
         assert!(
-            time_after > Duration::from_millis(1),
+            time_after > 1000,
             "It should take a millisecond with our pacing code installed"
         );
     }
@@ -125,11 +147,11 @@ mod tests {
             let (tx, rx) = SerialStream::pair().expect("Failed to open PTY");
             let start = Instant::now();
             read_write(tx, rx).await;
-            start.elapsed()
+            start.elapsed().as_micros()
         };
         assert!(
-            time_before < Duration::from_millis(1),
-            "It should not take a millisecond to write a line."
+            time_before < 1000,
+            "It should not take a millisecond normally."
         );
 
         let time_after = {
@@ -137,18 +159,13 @@ mod tests {
             // Wrap the tx side in a delay code, making it wait between writing and reading.
             let mut tx: SerialReadPacing<SerialStream> = tx.into();
             tx.set_delay(Duration::from_micros(1000));
-
             let start = Instant::now();
             read_write(tx, rx).await;
-            start.elapsed()
+            start.elapsed().as_micros()
         };
-        println!(
-            "time_before {} time_after {}",
-            time_before.as_micros(),
-            time_after.as_micros()
-        );
+        println!("time_before={time_before} time_after={time_after}");
         assert!(
-            time_after > Duration::from_millis(1),
+            time_after > 1000,
             "It should take a millisecond with our pacing code installed"
         );
     }
