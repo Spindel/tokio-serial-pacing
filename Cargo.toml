@@ -1,6 +1,6 @@
 [package]
 name = "tokio_serial_pacing"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "A pacing wrapper for SerialStream to ensure silence between Read & Write operations"

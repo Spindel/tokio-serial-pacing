@@ -142,10 +142,11 @@ fn past() -> Instant {
 /// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
 /// I would gain anything from it.
 ///
-// impl<S>  From<S> for SerialReadPacing<S> where S: AsyncRead + AsyncWrite { .... }
-// The whole thing would be identical?
-impl From<tokio_serial::SerialStream> for SerialReadPacing<tokio_serial::SerialStream> {
-    fn from(inner: tokio_serial::SerialStream) -> Self {
+impl<S> From<S> for SerialReadPacing<S>
+where
+    S: AsyncWrite + AsyncRead + Unpin,
+{
+    fn from(inner: S) -> Self {
         let past = past();
         let read_wait = Box::pin(sleep_until(past));
         Self {
@@ -166,10 +167,11 @@ impl From<tokio_serial::SerialStream> for SerialReadPacing<tokio_serial::SerialS
 /// In theory I could make this take anything that is AsyncRead + AsyncWrite as the input trait,
 /// but that seems to be over-the-top abstraction for the sake of abstraction, and I am not sure
 /// I would gain anything from it.
-// impl<S> From<S> for SerialWritePacing<S> where S: AsyncRead + AsyncWrite { .... }
-// The whole thing would be identical?
-impl From<tokio_serial::SerialStream> for SerialWritePacing<tokio_serial::SerialStream> {
-    fn from(inner: tokio_serial::SerialStream) -> Self {
+impl<S> From<S> for SerialWritePacing<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn from(inner: S) -> Self {
         let past = past();
         let write_wait = Box::pin(sleep_until(past));
         Self {
