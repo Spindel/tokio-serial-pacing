@@ -1,12 +1,13 @@
 // Author: D.S. Ljungmark <spider@skuggor.se>, Modio FA AB
 // SPDX-License-Identifier: MIT
+use async_io::Timer;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::io::Result as IoResult;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{sleep_until, Duration, Instant};
 
 /// Shared trait for [SerialReadPacing] and [SerialWritePacing] that implements `set_delay`
 pub trait SerialPacing {
@@ -34,7 +35,7 @@ pin_project! {
     pub struct SerialReadPacing<S> {
         #[pin]
         inner: S,
-        read_wait: Pin<Box<tokio::time::Sleep>>,
+        read_wait: Pin<Box<Timer>>,
         delay: Duration,
     }
 }
@@ -62,7 +63,7 @@ pin_project! {
     pub struct SerialWritePacing<S> {
         #[pin]
         inner: S,
-        write_wait: Pin<Box<tokio::time::Sleep>>,
+        write_wait: Pin<Box<Timer>>,
         delay: Duration,
     }
 }
@@ -148,7 +149,7 @@ where
 {
     fn from(inner: S) -> Self {
         let past = past();
-        let read_wait = Box::pin(sleep_until(past));
+        let read_wait = Box::pin(Timer::at(past));
         Self {
             inner,
             read_wait,
@@ -173,7 +174,7 @@ where
 {
     fn from(inner: S) -> Self {
         let past = past();
-        let write_wait = Box::pin(sleep_until(past));
+        let write_wait = Box::pin(Timer::at(past));
         Self {
             inner,
             write_wait,
@@ -218,9 +219,8 @@ where
         // This is to enforce a silence between us finishing a write_flush and starting a
         // receive, as there should be a 3.5 character timeout in between
 
-        // Check if the deadline is in the future before we await the timer, otherwise it causes a
-        // few ms of extra time spent, for some reason.
-        if this.read_wait.deadline() >= Instant::now() {
+        // if the timer is not armed, we do not wait.
+        if this.read_wait.will_fire() {
             // Now schedule the timer/timeout to wait for the deadline.
             if this.read_wait.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
@@ -240,8 +240,7 @@ where
             Poll::Ready(data) => {
                 // Flush has finished, re-arm the read_wait timeout so our next read will be
                 // after a moment of silence
-                let wait = Instant::now() + *this.delay;
-                this.read_wait.as_mut().reset(wait);
+                this.read_wait.as_mut().set_after(*this.delay);
                 Poll::Ready(data)
             }
         }
@@ -258,14 +257,15 @@ where
             Poll::Ready(data) => {
                 // Flush has finished, re-arm the read_wait timeout so our next read will be
                 // after a moment of silence
-                let wait = Instant::now() + *this.delay;
-                this.read_wait.as_mut().reset(wait);
+                this.read_wait.as_mut().set_after(*this.delay);
                 Poll::Ready(data)
             }
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        self.project().inner.poll_shutdown(cx)
+        let this = self.project();
+        this.read_wait.clear();
+        this.inner.poll_shutdown(cx)
     }
 }
 
@@ -285,8 +285,7 @@ where
         match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(data) => {
-                let wait = Instant::now() + *this.delay;
-                this.write_wait.as_mut().reset(wait);
+                this.write_wait.as_mut().set_after(*this.delay);
                 Poll::Ready(data)
             }
         }
@@ -298,9 +297,8 @@ where
 {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
         let this = self.project();
-        // Check if the deadline is in the future before we await the timer, otherwise it causes a
-        // few ms of extra time spent, for some reason.
-        if this.write_wait.deadline() >= Instant::now() {
+        // If timer is not armed, we do not wait for it.
+        if this.write_wait.will_fire() {
             // Now schedule the timer/timeout to wait for the deadline.
             if this.write_wait.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
@@ -310,9 +308,8 @@ where
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         let this = self.project();
-        // Check if the deadline is in the future before we await the timer, otherwise it causes a
-        // few ms of extra time spent, for some reason.
-        if this.write_wait.deadline() >= Instant::now() {
+        // If timer is not armed, we do not wait for it.
+        if this.write_wait.will_fire() {
             // Now schedule the timer/timeout to wait for the deadline.
             if this.write_wait.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
@@ -321,6 +318,8 @@ where
         this.inner.poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
-        self.project().inner.poll_shutdown(cx)
+        let this = self.project();
+        this.write_wait.clear();
+        this.inner.poll_shutdown(cx)
     }
 }
